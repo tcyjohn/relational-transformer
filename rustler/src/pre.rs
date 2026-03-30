@@ -37,6 +37,7 @@ const PBAR_TEMPLATE: &str = "{percent}% {bar} {decimal_bytes}/{decimal_total_byt
 struct ColStat {
     mean: f64,
     std: f64,
+    use_log1p: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +63,58 @@ fn cast_col_to_bool(df: DataFrame, col_name: &str) -> Result<DataFrame, PolarsEr
     df.lazy()
         .with_column(col(col_name).cast(DataType::Boolean).alias(col_name))
         .collect()
+}
+
+
+fn time_unit_scale_to_ns(u: TimeUnit) -> f64 {
+    match u {
+        TimeUnit::Nanoseconds => 1.0,
+        TimeUnit::Microseconds => 1_000.0,
+        TimeUnit::Milliseconds => 1_000_000.0,
+    }
+}
+
+fn datetime_raw_to_sec_i32(v: i64, u: TimeUnit) -> i32 {
+    match u {
+        TimeUnit::Nanoseconds => (v / 1_000_000_000) as i32,
+        TimeUnit::Microseconds => (v / 1_000_000) as i32,
+        TimeUnit::Milliseconds => (v / 1_000) as i32,
+    }
+}
+
+fn datetime_raw_to_ns_f64(v: i64, u: TimeUnit) -> f64 {
+    match u {
+        TimeUnit::Nanoseconds => v as f64,
+        TimeUnit::Microseconds => (v as f64) * 1_000.0,
+        TimeUnit::Milliseconds => (v as f64) * 1_000_000.0,
+    }
+}
+
+/// Regression target (db_name, table_name, col_name) triples from rt/tasks.py.
+/// These columns get log1p applied before standardization.
+fn is_regression_target(db_name: &str, table_name: &str, col_name: &str) -> bool {
+    matches!(
+        (db_name, table_name, col_name),
+        // forecast_reg_tasks
+        ("rel-hm", "item-sales", "sales")
+            | ("rel-amazon", "user-ltv", "ltv")
+            | ("rel-amazon", "item-ltv", "ltv")
+            | ("rel-stack", "post-votes", "popularity")
+            | ("rel-trial", "site-success", "success_rate")
+            | ("rel-trial", "study-adverse", "num_of_adverse_events")
+            | ("rel-event", "user-attendance", "target")
+            | ("rel-f1", "driver-position", "position")
+            | ("rel-avito", "ad-ctr", "num_click")
+            // autocomplete_reg_tasks
+            | ("rel-amazon", "review", "rating")
+            | ("rel-f1", "results", "position")
+            | ("rel-f1", "qualifying", "position")
+            | ("rel-trial", "studies", "enrollment")
+            | ("rel-f1", "constructor_results", "points")
+            | ("rel-f1", "constructor_standings", "position")
+            | ("rel-hm", "transactions", "price")
+            | ("rel-event", "users", "birthyear")
+    )
 }
 
 pub fn main(cli: Cli) {
@@ -122,7 +175,7 @@ pub fn main(cli: Cli) {
             _ => panic!(),
         };
         let tmp = metadata.get("fkey_col_to_pkey_table").unwrap();
-        let fcol_name_to_ptable_name = match from_str(tmp).unwrap() {
+        let mut fcol_name_to_ptable_name = match from_str(tmp).unwrap() {
             Value::Object(o) => o
                 .into_iter()
                 .map(|(k, v)| {
@@ -142,6 +195,7 @@ pub fn main(cli: Cli) {
                 .collect::<HashMap<_, _>>(),
             _ => panic!(),
         };
+        
         let tmp = metadata.get("time_col").unwrap();
         let tcol_name = match from_str(tmp).unwrap() {
             Value::Null => None,
@@ -166,7 +220,7 @@ pub fn main(cli: Cli) {
                     .to_string(),
                 match pq_path.file_stem().unwrap().to_str().unwrap() {
                     "train" => TableType::Train,
-                    "val" => TableType::Val,
+                    "val" | "validation" => TableType::Val,
                     "test" => TableType::Test,
                     _ => panic!(),
                 },
@@ -235,11 +289,11 @@ pub fn main(cli: Cli) {
             if table_name == "user-badge" {
                 df = cast_col_to_bool(df, "WillGetBadge").unwrap();
             }
-            if table_name == "posts" {
+            if table_name == "posts" && df.get_column_index("AcceptedAnswerId").is_some() {
                 df = df.drop("AcceptedAnswerId").unwrap();
             }
         }
-
+        
         // trial
         if cli.db_name == "rel-trial" && table_name == "study-outcome" {
             df = cast_col_to_bool(df, "outcome").unwrap();
@@ -271,10 +325,13 @@ pub fn main(cli: Cli) {
             }
             if table_name == "user-repeat"
                 || table_name == "user-ignore"
-                || table_name == "user-attendance"
             {
                 df = df.drop("index").unwrap();
                 df = cast_col_to_bool(df, "target").unwrap();
+            }
+            if table_name == "user-attendance" {
+                df = df.drop("index").unwrap();
+                // target 保持原始数值类型，由 is_regression_target 触发 log1p 标准化
             }
         }
 
@@ -287,6 +344,9 @@ pub fn main(cli: Cli) {
                 df = cast_col_to_bool(df, "num_click").unwrap();
             }
         }
+        // 关键：在所有 df 列修改完成后，过滤掉 metadata 里不存在于 df 的外键列
+        fcol_name_to_ptable_name.retain(|fcol, _| df.get_column_index(fcol).is_some());
+
 
         let num_rows = df.height() as i32;
         let num_cells = num_rows * df.width() as i32;
@@ -313,7 +373,12 @@ pub fn main(cli: Cli) {
     let mut dt_sum: f64 = 0.0;
     let mut dt_sum_sq: f64 = 0.0;
 
-    for table in table_map.values_mut() {
+    for ((_, table_type), table) in table_map.iter_mut() {
+        // [Bug 4 修复] Val/Test 的 col_stats 后续会从 Train 覆盖，无需提前计算
+        // [Bug 1 修复] 跳过 Val/Test 后，datetime 统计量自然只累加 Db 和 Train 的时间戳
+        if *table_type == TableType::Val || *table_type == TableType::Test {
+            continue;
+        }
         for col in table.df.iter() {
             let col = col.rechunk();
             match col.dtype() {
@@ -325,6 +390,7 @@ pub fn main(cli: Cli) {
                     table.col_stats.push(ColStat {
                         mean: col_mean,
                         std: col_std,
+                        use_log1p: false,
                     });
                 }
                 DataType::UInt32
@@ -334,46 +400,99 @@ pub fn main(cli: Cli) {
                 | DataType::Float32 => {
                     let col = col.cast(&DataType::Float64).unwrap().drop_nulls();
                     let col = col.filter(&col.is_not_nan().unwrap()).unwrap();
-                    let mean = col.mean().unwrap_or(0.0);
-                    let std = col.std(1).unwrap_or(1.0);
+                    let use_log1p =
+                        is_regression_target(&cli.db_name, &table.table_name, col.name());
+                    let (mean, std) = if use_log1p {
+                        // compute mean/std in log1p space
+                        let vals: Vec<f64> = col
+                            .iter()
+                            .enumerate()
+                            .map(|(i, x)| {
+                                let AnyValue::Float64(f) = x else { unreachable!() };
+                                let y = f.ln_1p();
+                                if !y.is_finite() {
+                                    panic!(
+                                        "log1p invalid: db={} table={} col={} row={} raw_value={} (ln_1p requires x > -1)",
+                                        cli.db_name, table.table_name, col.name(), i, f
+                                    );
+                                }
+                                y
+                            })
+                            .collect();
+                        let n = vals.len();
+                        let m = if n > 0 {
+                            vals.iter().sum::<f64>() / n as f64
+                        } else {
+                            0.0
+                        };
+                        let s = if n > 1 {
+                            (vals.iter().map(|&v| (v - m).powi(2)).sum::<f64>()
+                                / (n - 1) as f64)
+                                .sqrt()
+                        } else {
+                            1.0
+                        };
+                        println!(
+                            "  log1p stats for {}/{}: mean={:.6}, std={:.6}, n={}",
+                            table.table_name,
+                            col.name(),
+                            m,
+                            s,
+                            n,
+                        );
+                        (m, s)
+                    } else {
+                        (col.mean().unwrap_or(0.0), col.std(1).unwrap_or(1.0))
+                    };
                     let std = if std == 0.0 { 1.0 } else { std };
-                    table.col_stats.push(ColStat { mean, std });
+                    table.col_stats.push(ColStat { mean, std, use_log1p });
                 }
                 DataType::Datetime(u, _) => {
-                    assert!(*u == TimeUnit::Nanoseconds);
+                    let scale = time_unit_scale_to_ns(*u);
                     let col = col.cast(&DataType::Float64).unwrap().drop_nulls();
                     let col = col.filter(&col.is_not_nan().unwrap()).unwrap();
+                
                     dt_cnt += col.len();
-                    dt_sum += col.sum::<f64>().unwrap();
-                    dt_sum_sq += col
-                        .iter()
-                        .map(|x| {
-                            if let AnyValue::Float64(f) = x {
-                                f * f
-                            } else {
-                                panic!()
-                            }
-                        })
-                        .sum::<f64>();
-                    // let mean = col.mean().unwrap_or(0.0);
-                    // let std = col.std(1).unwrap_or(1.0);
-                    // let std = if std == 0.0 { 1.0 } else { std };
-                    // table.col_stats.push(ColStat { mean, std });
+                    dt_sum += col.iter().map(|x| {
+                        if let AnyValue::Float64(f) = x {
+                            f * scale
+                        } else {
+                            panic!()
+                        }
+                    }).sum::<f64>();
+                
+                    dt_sum_sq += col.iter().map(|x| {
+                        if let AnyValue::Float64(f) = x {
+                            let v = f * scale;
+                            v * v
+                        } else {
+                            panic!()
+                        }
+                    }).sum::<f64>();
+                
                     table.col_stats.push(ColStat {
                         mean: 0.0,
                         std: 0.0,
+                        use_log1p: false,
                     });
                 }
+                
                 _ => table.col_stats.push(ColStat {
                     mean: 0.0,
                     std: 0.0,
+                    use_log1p: false,
                 }),
             }
         }
     }
 
     let dt_mean = dt_sum / dt_cnt as f64;
-    let dt_std = (dt_sum_sq / dt_cnt as f64 - dt_mean * dt_mean).sqrt();
+    let dt_std = if dt_cnt > 1 {
+        // [Bug 2 修复] 改为样本标准差 (ddof=1)，与其他数值列的 col.std(1) 保持一致
+        ((dt_sum_sq - dt_sum * dt_sum / dt_cnt as f64) / (dt_cnt - 1) as f64).sqrt()
+    } else {
+        1.0
+    };
     dbg!(dt_cnt);
     dbg!(dt_sum);
     dbg!(dt_sum_sq);
@@ -479,17 +598,20 @@ pub fn main(cli: Cli) {
                     node.f2p_nbr_idxs.push(pnode_idx);
 
                     let timestamp = if let Some(c) = &table.tcol_name {
-                        table
-                            .df
-                            .column(c)
-                            .unwrap()
+                        let tcol = table.df.column(c).unwrap();
+                        let unit = match tcol.dtype() {
+                            DataType::Datetime(u, _) => *u,
+                            _ => panic!("time_col {} is not Datetime", c),
+                        };
+                        tcol
                             .datetime()
                             .unwrap()
                             .get(r)
-                            .map(|v| (v / 1_000_000_000) as i32)
+                            .map(|v| datetime_raw_to_sec_i32(v, unit))
                     } else {
                         None
                     };
+                    
                     node.timestamp = timestamp;
 
                     let l = text_to_idx.len() as i32;
@@ -500,17 +622,20 @@ pub fn main(cli: Cli) {
                     let ptable = &table_map[&(ptable_name.to_string(), TableType::Db)];
                     let ptimestamp = if ptable.tcol_name.is_some() {
                         let tcol_name = ptable.tcol_name.as_ref().unwrap();
-                        ptable
-                            .df
-                            .column(tcol_name)
-                            .unwrap()
+                        let tcol = ptable.df.column(tcol_name).unwrap();
+                        let unit = match tcol.dtype() {
+                            DataType::Datetime(u, _) => *u,
+                            _ => panic!("time_col {} is not Datetime", tcol_name),
+                        };
+                        tcol
                             .datetime()
                             .unwrap()
                             .get(val as usize)
-                            .map(|v| (v / 1_000_000_000) as i32)
+                            .map(|v| datetime_raw_to_sec_i32(v, unit))
                     } else {
                         None
                     };
+                    
 
                     let f2p_edge = Edge {
                         node_idx: pnode_idx,
@@ -566,6 +691,18 @@ pub fn main(cli: Cli) {
                         if val.is_nan() {
                             continue;
                         }
+                        let val = if col_stat.use_log1p {
+                            let v = val.ln_1p();
+                            if !v.is_finite() {
+                                panic!(
+                                    "log1p invalid: db={} table={} col={} row={} raw_value={} (ln_1p requires x > -1)",
+                                    cli.db_name, table.table_name, col.name(), r, val
+                                );
+                            }
+                            v
+                        } else {
+                            val
+                        };
                         let val = (val - col_stat.mean) / col_stat.std;
                         if val.is_infinite() {
                             dbg!(&table.table_name);
@@ -582,8 +719,8 @@ pub fn main(cli: Cli) {
                         node.class_value_idx.push(-1);
                     }
                     AnyValue::Datetime(val, unit, _) => {
-                        assert!(unit == TimeUnit::Nanoseconds);
-                        let val = (val as f64 - dt_mean) / dt_std;
+                        let val_ns = datetime_raw_to_ns_f64(val, unit);
+                        let val = (val_ns - dt_mean) / dt_std;
                         node.boolean_values.push(0.0);
                         node.number_values.push(0.0);
                         node.text_values.push(0);
@@ -591,7 +728,7 @@ pub fn main(cli: Cli) {
                         node.sem_types.push(SemType::DateTime);
                         node.col_name_idxs.push(col_name_idx);
                         node.class_value_idx.push(-1);
-                    }
+                    }                    
                     AnyValue::String(val) => {
                         let l = text_to_idx.len() as i32;
                         let text_idx = *text_to_idx.entry(val.to_string()).or_insert_with(|| l);

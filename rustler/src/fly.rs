@@ -228,6 +228,7 @@ pub struct Sampler {
     datasets: Vec<Dataset>,
     items: Vec<Item>,
     max_bfs_width: usize,
+    num_temporal_neighbors: usize,
     epoch: u64,
     d_text: usize,
     seed: u64,
@@ -246,6 +247,7 @@ impl Sampler {
         rank: usize,
         world_size: usize,
         max_bfs_width: usize,
+        num_temporal_neighbors: usize,
         embedding_model: &str,
         d_text: usize,
         seed: u64,
@@ -305,6 +307,7 @@ impl Sampler {
             datasets,
             items,
             max_bfs_width,
+            num_temporal_neighbors,
             epoch,
             d_text,
             seed,
@@ -409,22 +412,20 @@ impl Sampler {
 
             let p2f_edges = get_p2f_edges(dataset, node_idx);
 
-            // temporary storage for db edges to be subsampled
-            let mut db_p2f_ftr: Vec<i32> = Vec::new();
+            let mut db_p2f_ftr: Vec<(i32, i64)> = Vec::new();
 
             for edge in p2f_edges.iter() {
-                // include edges to task table only if seed node belongs to the task table
                 if edge.table_name_idx != seed_node.table_name_idx && edge.table_type != ArchivedTableType::Db {
                     continue;
                 }
 
-                // temporal constraint
                 if edge.timestamp.is_some() && seed_node.timestamp.is_some() && edge.timestamp > seed_node.timestamp {
                     continue;
                 }
 
                 if edge.table_type == ArchivedTableType::Db {
-                    db_p2f_ftr.push(edge.node_idx.into());
+                    let ts = extract_archived_ts(&edge.timestamp);
+                    db_p2f_ftr.push((edge.node_idx.into(), ts));
                     continue;
                 }
 
@@ -436,19 +437,22 @@ impl Sampler {
                 p2f_ftr[depth + 1].push(edge.node_idx.into());
             }
 
-            let idxs = if db_p2f_ftr.len() > self.max_bfs_width {
-                index::sample(&mut rng, db_p2f_ftr.len(), self.max_bfs_width).into_vec()
-            } else {
-                (0..db_p2f_ftr.len()).collect::<Vec<_>>()
-            };
+            let seed_ts = extract_archived_ts(&seed_node.timestamp);
+            let selected = temporal_sample(
+                &db_p2f_ftr,
+                seed_ts,
+                self.num_temporal_neighbors,
+                self.max_bfs_width,
+                &mut rng,
+            );
 
-            for idx in idxs.iter() {
+            for idx in selected.iter() {
                 if depth + 1 >= p2f_ftr.len() {
                     for _i in p2f_ftr.len()..=depth + 1 {
                         p2f_ftr.push(vec![]);
                     }
                 }
-                p2f_ftr[depth + 1].push(db_p2f_ftr[*idx]);
+                p2f_ftr[depth + 1].push(db_p2f_ftr[*idx].0);
             }
 
             let num_cells = node.col_name_idxs.len();
@@ -461,9 +465,9 @@ impl Sampler {
                 }
                 slices.node_idxs[seq_i] = node.node_idx.into();
 
-                assert!(node.f2p_nbr_idxs.len() <= MAX_F2P_NBRS);
-                for (j, f2p_nbr_idx) in node.f2p_nbr_idxs.iter().enumerate() {
-                    slices.f2p_nbr_idxs[seq_i * MAX_F2P_NBRS + j] = f2p_nbr_idx.into();
+                let nbr_count = node.f2p_nbr_idxs.len().min(MAX_F2P_NBRS);
+                for j in 0..nbr_count {
+                    slices.f2p_nbr_idxs[seq_i * MAX_F2P_NBRS + j] = node.f2p_nbr_idxs[j].into();
                 }
 
                 slices.table_name_idxs[seq_i] = node.table_name_idx.into();
@@ -531,6 +535,57 @@ fn get_text_emb(dataset: &Dataset, idx: i32, d_text: usize) -> &[bf16] {
     &text_emb[(idx as usize) * d_text..(idx as usize + 1) * d_text]
 }
 
+/// Extract an `Option<i32>` timestamp into i64 for distance computation.
+/// Returns `i64::MAX` when the timestamp is absent.
+fn extract_archived_ts(ts: &<Option<i32> as rkyv::Archive>::Archived) -> i64 {
+    ts.as_ref().map(|v| i32::from(*v) as i64).unwrap_or(i64::MAX)
+}
+
+/// Select indices from `db_edges` with temporal-neighbor priority.
+///
+/// 1. If `num_temporal > 0` and the seed has a valid timestamp, sort candidates
+///    by `|edge_ts - seed_ts|` and take the closest `num_temporal` edges first.
+/// 2. From the remaining candidates, randomly sample up to `max_random` edges.
+/// 3. When `num_temporal == 0` or the seed has no timestamp, fall back to pure
+///    random sampling of `max_random` (identical to the original behaviour).
+fn temporal_sample(
+    db_edges: &[(i32, i64)],
+    seed_ts: i64,
+    num_temporal: usize,
+    max_random: usize,
+    rng: &mut StdRng,
+) -> Vec<usize> {
+    if db_edges.is_empty() {
+        return Vec::new();
+    }
+
+    if num_temporal > 0 && seed_ts != i64::MAX {
+        let mut indices: Vec<usize> = (0..db_edges.len()).collect();
+        indices.sort_by_key(|&i| {
+            let ts = db_edges[i].1;
+            if ts == i64::MAX { u64::MAX } else { (ts - seed_ts).unsigned_abs() }
+        });
+
+        let n_temporal = num_temporal.min(indices.len());
+        let mut selected: Vec<usize> = indices[..n_temporal].to_vec();
+
+        let remaining = &indices[n_temporal..];
+        let n_random = max_random.min(remaining.len());
+        if n_random > 0 {
+            let sampled = index::sample(rng, remaining.len(), n_random).into_vec();
+            for idx in sampled {
+                selected.push(remaining[idx]);
+            }
+        }
+
+        selected
+    } else if db_edges.len() > max_random {
+        index::sample(rng, db_edges.len(), max_random).into_vec()
+    } else {
+        (0..db_edges.len()).collect()
+    }
+}
+
 #[derive(Parser)]
 pub struct Cli {
     #[arg(default_value = "rel-f1")]
@@ -552,6 +607,7 @@ pub fn main(cli: Cli) {
         0,                          // rank
         1,                          // world_size
         256,                        // max_bfs_width
+        0,                          // num_temporal_neighbors
         "all-MiniLM-L12-v2",        // embedding_model
         384,                        // d_text
         0,                          // seed
