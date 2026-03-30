@@ -1,6 +1,10 @@
+import contextlib
+import gc
+import json
 import os
 import random
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +20,37 @@ from tqdm.auto import tqdm
 
 from rt.data import RelationalDataset
 from rt.model import RelationalTransformer
+
+
+def _dlog(
+    location: str,
+    message: str,
+    data: dict[str, object] | None = None,
+    hypothesis_id: str = "",
+    run_id: str = "",
+) -> None:
+    """Append one JSON line to ``RT_DEBUG_LOG`` if set; no-op otherwise."""
+    path = os.environ.get("RT_DEBUG_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "location": location,
+                        "message": message,
+                        "data": data or {},
+                        "hypothesisId": hypothesis_id,
+                        "runId": run_id,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
 
 
 def seed_everything(seed=42):
@@ -80,6 +115,7 @@ def main(
     batch_size,
     num_workers,
     max_bfs_width,
+    num_temporal_neighbors,
     # optimization
     lr,
     wd,
@@ -94,15 +130,20 @@ def main(
     d_model,
     num_heads,
     d_ff,
+    grad_accum_steps=1,
+    use_full_attention=True,
 ):
     seed_everything(seed)
 
     ddp = "LOCAL_RANK" in os.environ
     device = "cuda"
+    _own_process_group = False
     if ddp:
         os.environ["OMP_NUM_THREADS"] = f"{num_workers}"
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        dist.init_process_group("nccl")
+        if not dist.is_initialized():
+            dist.init_process_group("nccl")
+            _own_process_group = True
     if ddp:
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -114,7 +155,6 @@ def main(
         run = wandb.init(project=project, config=locals())
         print(run.name)
 
-    torch.multiprocessing.set_sharing_strategy("file_system")
     torch._dynamo.config.cache_size_limit = 16
     torch._dynamo.config.compiled_autograd = compile_ if ddp else False
     torch._dynamo.config.optimize_ddp = True
@@ -130,6 +170,7 @@ def main(
         rank=rank,
         world_size=world_size,
         max_bfs_width=max_bfs_width,
+        num_temporal_neighbors=num_temporal_neighbors,
         embedding_model=embedding_model,
         d_text=d_text,
         seed=seed,
@@ -138,12 +179,16 @@ def main(
         dataset,
         batch_size=None,
         num_workers=num_workers,
-        persistent_workers=False,
+        persistent_workers=num_workers > 0,
         pin_memory=True,
         in_order=True,
     )
+    steps_per_epoch = len(loader)
+    recent_step_times = deque(maxlen=100)
+    if rank == 0:
+        print(f"{steps_per_epoch=}")
 
-    eval_loaders = {}
+    eval_datasets = {}
     for db_name, table_name, target_column, columns_to_drop in eval_tasks:
         for split in eval_splits:
             eval_dataset = RelationalDataset(
@@ -153,19 +198,25 @@ def main(
                 rank=rank,
                 world_size=world_size,
                 max_bfs_width=max_bfs_width,
+                num_temporal_neighbors=num_temporal_neighbors,
                 embedding_model=embedding_model,
                 d_text=d_text,
                 seed=0,
             )
             eval_dataset.sampler.shuffle_py(0)
-            eval_loaders[(db_name, table_name, split)] = DataLoader(
-                eval_dataset,
-                batch_size=None,
-                num_workers=num_workers,
-                persistent_workers=True,
-                pin_memory=True,
-                in_order=True,
-            )
+            eval_datasets[(db_name, table_name, split)] = eval_dataset
+
+    eval_num_workers = min(num_workers, 2)
+    eval_loaders = {}
+    for key, eval_dataset in eval_datasets.items():
+        eval_loaders[key] = DataLoader(
+            eval_dataset,
+            batch_size=None,
+            num_workers=eval_num_workers,
+            persistent_workers=False,
+            pin_memory=True,
+            in_order=True,
+        )
 
     net = RelationalTransformer(
         num_blocks=num_blocks,
@@ -173,11 +224,18 @@ def main(
         d_text=d_text,
         num_heads=num_heads,
         d_ff=d_ff,
+        use_full_attention=use_full_attention,
     )
     if load_ckpt_path is not None:
         load_ckpt_path = Path(load_ckpt_path).expanduser()
         state_dict = torch.load(load_ckpt_path, map_location="cpu")
-        net.load_state_dict(state_dict)
+        missing, unexpected = net.load_state_dict(state_dict, strict=False)
+        if rank == 0 and (missing or unexpected):
+            print(f"Checkpoint load: {len(missing)} missing, {len(unexpected)} unexpected keys")
+            if missing:
+                print(f"  missing:    {missing[:5]}{'...' if len(missing) > 5 else ''}")
+            if unexpected:
+                print(f"  unexpected: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
     if rank == 0:
         param_count = sum(p.numel() for p in net.parameters())
@@ -212,19 +270,11 @@ def main(
     if rank == 0:
         wandb.log({"epochs": 0}, step=steps)
 
-    eval_loader_iters = {}
-    for k, eval_loader in eval_loaders.items():
-        eval_loader_iters[k] = iter(eval_loader)
-
     def evaluate(net):
         metrics = {"val": {}, "test": {}}
         net.eval()
         with torch.inference_mode():
-            for (
-                db_name,
-                table_name,
-                split,
-            ), eval_loader_iter in eval_loader_iters.items():
+            for (db_name, table_name, split), eval_loader in eval_loaders.items():
                 if table_name in [
                     "item-sales",
                     "user-ltv",
@@ -244,7 +294,6 @@ def main(
                 labels = []
                 losses = []
                 eval_load_times = []
-                eval_loader = eval_loaders[(db_name, table_name, split)]
                 pbar = tqdm(
                     total=(
                         min(max_eval_steps, len(eval_loader))
@@ -256,13 +305,9 @@ def main(
                 )
 
                 batch_idx = 0
-                while True:
+                for batch in eval_loader:
                     tic = time.time()
-                    try:
-                        batch = next(eval_loader_iter)
-                        batch_idx += 1
-                    except StopIteration:
-                        break
+                    batch_idx += 1
                     toc = time.time()
                     pbar.update(1)
 
@@ -299,14 +344,12 @@ def main(
                     if max_eval_steps > -1 and batch_idx >= max_eval_steps:
                         break
 
-                eval_loader_iters[(db_name, table_name, split)] = iter(eval_loader)
-
+                gc.collect()
                 pbar.close()
                 preds = torch.cat(preds, dim=0)
                 labels = torch.cat(labels, dim=0)
 
                 if ddp:
-                    # ensure the predictions and labels are gathered jointly
                     preds = all_gather_nd(preds)
                     labels = all_gather_nd(labels)
                 else:
@@ -333,13 +376,41 @@ def main(
                         metric = r2_score(labels, preds)
                     elif task_type == "clf":
                         metric_name = "auc"
-                        labels = [int(x > 0) for x in labels]
-                        metric = roc_auc_score(labels, preds)
+                        #避免只有一种类别时报错
+                        labels_bin = np.array([int(x > 0) for x in labels], dtype=np.int64)
+                        if len(np.unique(labels_bin)) < 2:
+                            metric = float("nan")
+                            print(
+                                f"\nstep={steps}, \t{db_name}/{table_name}/{split}: "
+                                "skipping AUC (only one class in y_true)"
+                            )
+                        else:
+                            metric = roc_auc_score(labels_bin, preds)
 
                     k = f"{metric_name}/{db_name}/{table_name}/{split}"
                     wandb.log({k: metric}, step=steps)
                     print(f"\nstep={steps}, \t{k}: {metric}")
                     metrics[split][(db_name, table_name)] = metric
+                    if task_type == "reg":
+                        _dlog(
+                            "main.py:evaluate",
+                            "reg_eval_diag",
+                            {
+                                "step": steps,
+                                "db": db_name,
+                                "table": table_name,
+                                "split": split,
+                                "r2": float(metric),
+                                "pred_mean": float(np.mean(preds)),
+                                "pred_std": float(np.std(preds)),
+                                "label_mean": float(np.mean(labels)),
+                                "label_std": float(np.std(labels)),
+                                "pred_p99": float(np.percentile(preds, 99)),
+                                "label_p99": float(np.percentile(labels, 99)),
+                            },
+                            "H1H3",
+                            "eval",
+                        )
 
         return metrics
 
@@ -366,12 +437,16 @@ def main(
     best_val_metrics = dict()
     best_test_metrics = dict()
 
+    optimizer_steps_per_epoch = steps_per_epoch / grad_accum_steps
+    if rank == 0:
+        print(f"{grad_accum_steps=}, effective_batch_size={batch_size * world_size * grad_accum_steps}")
+
     while steps < max_steps:
-        loader.dataset.sampler.shuffle_py(int(steps / len(loader)))
+        loader.dataset.sampler.shuffle_py(int(steps * grad_accum_steps / len(loader)))
         loader_iter = iter(loader)
         while steps < max_steps:
-            if (eval_freq is not None and steps % eval_freq == 0) or (
-                eval_pow2 and steps & (steps - 1) == 0
+            if (eval_freq is not None and steps > 0 and steps % eval_freq == 0) or (
+                eval_pow2 and steps > 0 and steps & (steps - 1) == 0
             ):
                 metrics = evaluate(net)
                 if save_ckpt_dir is not None:
@@ -392,27 +467,51 @@ def main(
                             checkpoint()
 
             net.train()
-
-            tic = time.time()
-            try:
-                batch = next(loader_iter)
-            except StopIteration:
-                break
-            batch.pop("true_batch_size")
-            for k in batch:
-                batch[k] = batch[k].to(device, non_blocking=True)
-            toc = time.time()
-            load_time = toc - tic
-            if rank == 0:
-                wandb.log({"load_time": load_time}, step=steps)
-
-            loss, _yhat_dict = net(batch)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            accum_loss = 0.0
+            epoch_ended = False
+            tic_step = time.perf_counter()
+
+            for micro_step in range(grad_accum_steps):
+                tic = time.time()
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    epoch_ended = True
+                    break
+                batch.pop("true_batch_size")
+                for k in batch:
+                    batch[k] = batch[k].to(device, non_blocking=True)
+                toc = time.time()
+                load_time = toc - tic
+
+                is_last_micro_step = (micro_step == grad_accum_steps - 1)
+                ctx = contextlib.nullcontext() if (not ddp or is_last_micro_step) else net.no_sync()
+                with ctx:
+                    loss, _yhat_dict = net(batch)
+                    (loss / grad_accum_steps).backward()
+                accum_loss += loss.detach()
+
+            if epoch_ended:
+                break
 
             grad_norm = get_total_norm(
                 [p.grad for p in net.parameters() if p.grad is not None]
             )
+            if rank == 0 and (steps % 100 == 0):
+                grad_norm_val = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                _dlog(
+                    "main.py:train",
+                    "grad_clip_diag",
+                    {
+                        "step": steps,
+                        "grad_norm": grad_norm_val,
+                        "max_grad_norm": float(max_grad_norm),
+                        "is_clipped": bool(grad_norm_val > max_grad_norm),
+                    },
+                    "H2",
+                    "train",
+                )
             clip_grads_with_norm_(
                 net.parameters(), max_norm=max_grad_norm, total_norm=grad_norm
             )
@@ -420,21 +519,36 @@ def main(
             opt.step()
             if lr_schedule:
                 lrs.step()
+            step_time = time.perf_counter() - tic_step
+            recent_step_times.append(step_time)
 
             steps += 1
 
+            accum_loss = accum_loss / grad_accum_steps
             if ddp:
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(accum_loss, op=dist.ReduceOp.AVG)
             if rank == 0:
+                avg_step_time = sum(recent_step_times) / len(recent_step_times)
+                est_epoch_seconds = avg_step_time * optimizer_steps_per_epoch
                 wandb.log(
                     {
-                        "loss": loss,
+                        "loss": accum_loss.item(),
+                        "load_time": load_time,
                         "lr": opt.param_groups[0]["lr"],
-                        "epochs": steps / len(loader),
+                        "epochs": steps / optimizer_steps_per_epoch,
                         "grad_norm": grad_norm,
+                        "step_time": step_time,
+                        "step_time_avg": avg_step_time,
+                        "est_epoch_minutes": est_epoch_seconds / 60.0,
                     },
                     step=steps,
                 )
+                if steps % 200 == 0:
+                    print(
+                        f"step={steps} | avg_step_time={avg_step_time:.3f}s | "
+                        f"est_epoch={est_epoch_seconds / 60.0:.1f} min "
+                        f"({est_epoch_seconds / 3600.0:.2f} h)"
+                    )
 
             pbar.update(1)
 
@@ -447,8 +561,17 @@ def main(
             print(f"{db_name}/{table_name}/test: {metric:.4f}")
         print("="*80 + "\n")
 
-    if ddp:
+    if ddp and _own_process_group:
         dist.destroy_process_group()
+
+    if rank == 0:
+        return {
+            "best_val_metrics": best_val_metrics,
+            "best_test_metrics": best_test_metrics,
+            "steps": steps,
+            "steps_per_epoch": steps_per_epoch,
+        }
+    return None
 
 
 if __name__ == "__main__":

@@ -21,11 +21,14 @@ class MaskedAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
         self.num_heads = num_heads
+        head_dim = d_model // num_heads
 
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=False)
+        self.q_norm = nn.RMSNorm(head_dim)
+        self.k_norm = nn.RMSNorm(head_dim)
 
     def forward(self, x, block_mask):
         q = self.wq(x)
@@ -35,6 +38,9 @@ class MaskedAttention(nn.Module):
         q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         if block_mask is None:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -65,22 +71,24 @@ class RelationalBlock(nn.Module):
         d_model,
         num_heads,
         d_ff,
+        use_full_attention=True,
     ):
         super().__init__()
+        self.attn_layers = ["col", "feat", "nbr", "full"] if use_full_attention else ["col", "feat", "nbr"]
 
         self.norms = nn.ModuleDict(
-            {l: nn.RMSNorm(d_model) for l in ["feat", "nbr", "col", "full", "ffn"]}
+            {l: nn.RMSNorm(d_model) for l in [*self.attn_layers, "ffn"]}
         )
         self.attns = nn.ModuleDict(
             {
                 l: MaskedAttention(d_model, num_heads)
-                for l in ["feat", "nbr", "col", "full"]
+                for l in self.attn_layers
             }
         )
         self.ffn = FFN(d_model, d_ff)
 
     def forward(self, x, block_masks):
-        for l in ["col", "feat", "nbr", "full"]:
+        for l in self.attn_layers:
             x = x + self.attns[l](self.norms[l](x), block_mask=block_masks[l])
         x = x + self.ffn(self.norms["ffn"](x))
         return x
@@ -109,6 +117,8 @@ class RelationalTransformer(nn.Module):
         d_text,
         num_heads,
         d_ff,
+        use_full_attention=True,
+        huber_delta: float = 1.0,
     ):
         super().__init__()
 
@@ -145,37 +155,38 @@ class RelationalTransformer(nn.Module):
             }
         )
         self.blocks = nn.ModuleList(
-            [RelationalBlock(d_model, num_heads, d_ff) for i in range(num_blocks)]
+            [
+                RelationalBlock(d_model, num_heads, d_ff, use_full_attention=use_full_attention)
+                for i in range(num_blocks)
+            ]
         )
         self.norm_out = nn.RMSNorm(d_model)
         self.d_model = d_model
+        self.huber_delta = huber_delta
 
     def forward(self, batch):
-        node_idxs = batch["node_idxs"]
-        f2p_nbr_idxs = batch["f2p_nbr_idxs"]
-        col_name_idxs = batch["col_name_idxs"]
-        table_name_idxs = batch["table_name_idxs"]
-        is_padding = batch["is_padding"]
+        node_idxs = batch["node_idxs"]  #每个 token 属于哪一行 (B, S) S是表格里的token数
+        f2p_nbr_idxs = batch["f2p_nbr_idxs"]    #每个 q 的 foreign -> primary 邻居列表 (B, S, K)
+        col_name_idxs = batch["col_name_idxs"]  #每个 token 属于哪一列 (B, S)
+        table_name_idxs = batch["table_name_idxs"]  #每个 token 属于哪个 table (B, S)
+        is_padding = batch["is_padding"]    #这个位置是不是 padding token（可能用来做temporal filtering）
         batch_size, seq_len = node_idxs.shape
 
         batch_size, seq_len = node_idxs.shape
         device = node_idxs.device
 
-        # Padding mask for attention pairs (allow only non-pad -> non-pad)
+        # 以下的 None 索引本质上等价于 unsqueeze
+        # Padding mask for attention pairs (只允许“非 padding token -> 非 padding token”)
         pad = (~is_padding[:, :, None]) & (~is_padding[:, None, :])  # (B, S, S)
 
-        # cells in the same node
+        # cells in the same row
         same_node = node_idxs[:, :, None] == node_idxs[:, None, :]  # (B, S, S)
 
         # kv index is among q's foreign -> primary neighbors
-        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(
-            -1
-        )  # (B, S, S)
+        kv_in_f2p = (node_idxs[:, None, :, None] == f2p_nbr_idxs[:, :, None, :]).any(-1)  # (B, S, S)
 
         # q index is among kv's primary -> foreign neighbors (reverse relation)
-        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(
-            -1
-        )  # (B, S, S)
+        q_in_f2p = (node_idxs[:, :, None, None] == f2p_nbr_idxs[:, None, :, :]).any(-1)  # (B, S, S)
 
         # Same column AND same table
         same_col_table = (col_name_idxs[:, :, None] == col_name_idxs[:, None, :]) & (
@@ -248,7 +259,12 @@ class RelationalTransformer(nn.Module):
                 continue
 
             if t in ("number", "datetime"):
-                loss_t = F.huber_loss(yhat, y, reduction="none").mean(-1)
+                loss_t = F.huber_loss(
+                    yhat,
+                    y,
+                    reduction="none",
+                    delta=self.huber_delta,
+                ).mean(-1)
             elif t == "boolean":
                 loss_t = F.binary_cross_entropy_with_logits(
                     yhat, (y > 0).float(), reduction="none"

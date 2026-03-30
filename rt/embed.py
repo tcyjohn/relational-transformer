@@ -18,7 +18,8 @@ class TextEmbedder:
                 "dtype": torch.bfloat16 if device_type == "cuda" else torch.float32,
             },
         )
-        self.model = torch.compile(self.model)
+        if os.environ.get("RT_EMBED_COMPILE", "").strip().lower() in ("1", "true", "yes"):
+            self.model = torch.compile(self.model)
         self.batch_size = batch_size
 
     def __call__(self, text_list, device=None):
@@ -68,7 +69,9 @@ def main(
     )
 
     emb_path = f"{os.environ['HOME']}/scratch/pre/{dataset_name}/text_emb_{embedding_model}.bin"
-    emb = np.stack(emb_list).astype(bfloat16)
+    # SentenceTransformer.encode 在 convert_to_numpy=True 时已经返回 ndarray，
+    # 直接转换 dtype 即可，避免再 stack 一次造成额外内存占用（容易在大数据集上 OOM）。
+    emb = np.asarray(emb_list, dtype=bfloat16)
     emb.tofile(emb_path)
 
 
