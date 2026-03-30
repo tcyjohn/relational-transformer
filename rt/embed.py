@@ -10,6 +10,8 @@ from tqdm import tqdm
 
 
 class TextEmbedder:
+    """SentenceTransformer wrapper. Set ``RT_EMBED_COMPILE=1`` to wrap the model with ``torch.compile``."""
+
     def __init__(self, batch_size, embedding_model, device_type):
         self.model = SentenceTransformer(
             f"sentence-transformers/{embedding_model}",
