@@ -5,3 +5,6 @@ __pycache__
 /wandb
 .vscode
 /ckpts
+.cursor/
+run.log
+run_all.sh
